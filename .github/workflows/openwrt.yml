@@ -1,0 +1,47 @@
+name: OpenWrt checks
+on:
+  pull_request:
+    paths: ['openwrt/**', '.github/workflows/openwrt.yml']
+  push:
+    branches: [main, feat/openwrt-gateway]
+    paths: ['openwrt/**', '.github/workflows/openwrt.yml']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: openwrt
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: openwrt/core/hillstone/go.mod
+          cache: false
+      - name: Install namespace test tools
+        run: sudo apt-get update && sudo apt-get install -y iproute2 nftables iputils-ping
+      - name: Python and LuCI tests
+        run: |
+          python3 -m unittest discover -s tests
+          node tests/test-luci.cjs
+          node tests/test-certificate-ui.cjs
+      - name: Core race tests and Linux static checks
+        working-directory: openwrt/core/hillstone
+        run: |
+          go test -race ./...
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go vet ./...
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go vet ./...
+      - name: Real kernel routing and priority checks
+        run: |
+          sudo sh tests/test-routing-netns.sh package/luci-app-xdvpn/root/usr/libexec/xdvpn/priority
+          sudo sh tests/test-priority-kernel.sh package/luci-app-xdvpn/root/usr/libexec/xdvpn/priority-status
+      - name: Build public packages without private inputs
+        run: |
+          python3 scripts/build-ipk.py
+          python3 scripts/build-hillstone-ipk.py --arch x86_64
+          python3 scripts/build-hillstone-ipk.py --arch aarch64_generic
+          python3 scripts/build-hillstone-ipk.py --arch aarch64_cortex-a53

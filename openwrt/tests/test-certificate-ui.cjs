@@ -1,0 +1,33 @@
+global.L = {resource: p => '/luci-static/resources/' + p};
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const values = { proto:'xdvpn_hillstone',server:'vpn.example.com',port:'4433', '.type':'interface', '.name':'xdvpn' };
+const uci = {get:(c,s,k)=>values[k],set:(c,s,k,v)=>values[k]=v,unset:(c,s,k)=>delete values[k],sections:()=>{}};
+const options={};let saves=0, connects=0, modal=null, notices=[];
+const info={endpoint:'vpn.example.com:4433',sha256:'a'.repeat(64),ca_valid:false,saved_pin_matches:false,subject:'Test certificate',expires:'2030-01-01'};
+const rpc={declare:d=>()=>{ if(d.object==='xdvpn')return Promise.resolve({...info}); if(d.method==='up')connects++;return Promise.resolve({});}};
+const form={Map:function(){this.section=()=>({option:(t,n)=>options[n]={value(){},depends(){},formvalue(){return values[n];}}});this.render=()=>Promise.resolve({});this.save=()=>{saves++;return Promise.resolve();};}};
+const E=(tag,attrs,children)=>({tag,attrs,children});
+const ui={showModal:(title,children)=>modal=children,hideModal:()=>modal=null,addNotification:(a,v)=>notices.push(v)};
+function find(nodes,label){for(const node of (Array.isArray(nodes)?nodes:[nodes])){if(!node||typeof node!=='object')continue;if(node.tag==='button'&&node.children===label)return node;const x=find(node.children,label);if(x)return x;}}
+const source=fs.readFileSync('package/luci-app-xdvpn/htdocs/luci-static/resources/view/xdvpn/main.js','utf8');
+const view=new Function('view','form','uci','rpc','poll','ui','E',source)({extend:x=>x},form,uci,rpc,{add(){}},ui,E);
+(async()=>{
+ const tree=await view.render();
+ await find(tree,'连接 VPN').attrs.click();
+ assert.equal(connects,0,'unconfirmed self signed certificate must not connect');
+ assert.ok(modal);
+ await find(modal,'已核实，信任此证书').attrs.click();
+ assert.equal(values.xdvpn_certpin,info.sha256);assert.equal(values.xdvpn_cert_endpoint,info.endpoint);assert.equal(saves,1);
+ info.saved_pin_matches=true;
+ await find(tree,'连接 VPN').attrs.click();assert.equal(connects,1);
+ info.saved_pin_matches=false;info.sha256='b'.repeat(64);
+ await find(tree,'连接 VPN').attrs.click();assert.equal(connects,1,'changed certificate must not connect');
+ assert.ok(modal);
+ ui.hideModal();delete values.xdvpn_certpin;info.ca_valid=true;
+ await find(tree,'连接 VPN').attrs.click();assert.equal(connects,2,'CA verified server connects without manual fingerprint');
+ info.endpoint='other.example.com:4433';
+ await options._certificate.onclick();assert.equal(modal,null,'unsaved endpoint mismatch must not be trusted');
+ assert.ok(notices.length);
+ console.log('Certificate UI first trust / changed certificate / CA / endpoint mismatch: PASS');
+})().catch(e=>{console.error(e);process.exitCode=1;});

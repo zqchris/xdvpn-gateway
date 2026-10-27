@@ -1,0 +1,10 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+if [ "$(uci -q get network.xdvpn.xdvpn_owned)" = 1 ] && [ "$(uci -q get network.xdvpn.proto)" = xdvpn_hillstone ]; then
+    ifdown xdvpn
+    if [ "$1" != upgrade ]; then
+        uci set network.xdvpn.auto=0
+        uci commit network
+    fi
+fi
+exit 0

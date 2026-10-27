@@ -1,0 +1,185 @@
+#!/bin/sh
+# Shared fw4 policy for both VPN cores. No proxy configuration is edited.
+set -eu
+umask 077
+state=/var/run/xdvpn-priority
+mkdir -p "$state"
+init() {
+ nft list table inet fw4 >/dev/null 2>&1
+ if ! nft list table inet xdvpn_guard >/dev/null 2>&1; then
+ nft -f - <<'RULES'
+add table inet xdvpn_guard
+add set inet xdvpn_guard allow4 { type ipv4_addr; flags interval; auto-merge; }
+add set inet xdvpn_guard deny4 { type ipv4_addr; flags interval; auto-merge; }
+add set inet xdvpn_guard domain4 { type ipv4_addr; flags timeout; timeout 1h; size 4096; }
+add set inet xdvpn_guard deny6 { type ipv6_addr; flags interval; auto-merge; }
+add chain inet xdvpn_guard egress { type filter hook postrouting priority 99; policy accept; }
+add rule inet xdvpn_guard egress oifname "vpn-xdvpn" ip daddr @deny4 counter drop comment "xdvpn-protected-drop"
+add rule inet xdvpn_guard egress oifname "vpn-xdvpn" meta nfproto ipv6 counter drop comment "xdvpn-no-ipv6"
+add rule inet xdvpn_guard egress oifname "vpn-xdvpn" ip daddr != @allow4 ip daddr != @domain4 counter drop comment "xdvpn-not-company-drop"
+RULES
+ fi
+ nft list set inet xdvpn_guard block4 >/dev/null 2>&1 || nft "add set inet xdvpn_guard block4 { type ipv4_addr; flags interval; auto-merge; }"
+ for name in allow4 deny4 bypass4 block4; do
+ nft list set inet fw4 "xdvpn_$name" >/dev/null 2>&1 || nft "add set inet fw4 xdvpn_$name { type ipv4_addr; flags interval; auto-merge; }"
+ done
+ nft list set inet fw4 xdvpn_domain4 >/dev/null 2>&1 || nft "add set inet fw4 xdvpn_domain4 { type ipv4_addr; flags timeout; timeout 1h; size 4096; }"
+ nft list set inet xdvpn_guard domain4 >/dev/null 2>&1 || nft "add set inet xdvpn_guard domain4 { type ipv4_addr; flags timeout; timeout 1h; size 4096; }"
+ nft list chain inet fw4 xdvpn_select >/dev/null 2>&1 || nft add chain inet fw4 xdvpn_select
+}
+join_cidrs() {
+ result=""
+ for cidr in $1; do
+  case "$cidr" in *[!0-9./]*|'') return 1;; esac
+  result="${result}${result:+, }$cidr"
+ done
+ printf '%s' "$result"
+}
+restore() {
+ init
+ [ ! -e "$state/pbr-owned" ] || ip -4 route replace table 51834 default dev vpn-xdvpn
+ f=$(mktemp "$state/restore.XXXXXX")
+ printf 'flush set inet fw4 xdvpn_domain4\nflush set inet fw4 xdvpn_deny4\n' > "$f"
+ nft list set inet xdvpn_guard deny4 | sed -n '/elements = /,$p' | sed '$d' | sed '$d' | sed '1s/.*elements = /add element inet fw4 xdvpn_deny4 /' >> "$f"
+ printf 'flush set inet fw4 xdvpn_block4\n' >> "$f"
+ nft list set inet xdvpn_guard block4 | sed -n '/elements = /,$p' | sed '$d' | sed '$d' | sed '1s/.*elements = /add element inet fw4 xdvpn_block4 /' >> "$f"
+ nft -j list set inet xdvpn_guard domain4 >/dev/null 2>&1 || return 1
+ # Strip timeout metadata when mirroring into fw4; source set owns expiry.
+ nft list set inet xdvpn_guard domain4 | sed -n '/elements = /,$p' | sed '$d' | sed '$d' | sed '1s/.*elements = /add element inet fw4 xdvpn_domain4 /; s/ timeout [^ ,}]*//g; s/ expires [^ ,}]*//g' >> "$f"
+ for name in allow bypass; do
+  printf 'flush set inet fw4 xdvpn_%s4\n' "$name" >> "$f"
+  [ ! -s "$state/$name" ] || printf 'add element inet fw4 xdvpn_%s4 { %s }\n' "$name" "$(cat "$state/$name")" >> "$f"
+ done
+ cat >> "$f" <<'RULES'
+flush chain inet fw4 xdvpn_select
+add rule inet fw4 xdvpn_select iifname "vpn-xdvpn" meta mark set meta mark & 0xcfffffff counter accept comment "xdvpn-return-traffic"
+add rule inet fw4 xdvpn_select ip daddr @xdvpn_block4 meta mark set (meta mark & 0xdfffffff) | 0x10000000 counter return
+add rule inet fw4 xdvpn_select ip daddr @xdvpn_bypass4 meta mark set (meta mark & 0xdfffffff) | 0x10000000 return
+add rule inet fw4 xdvpn_select ip daddr @xdvpn_deny4 meta mark set (meta mark & 0xdfffffff) | 0x10000000 return
+add rule inet fw4 xdvpn_select ip daddr @xdvpn_domain4 meta mark set (meta mark & 0xefffffff) | 0x20000000 counter accept
+add rule inet fw4 xdvpn_select ip daddr @xdvpn_allow4 meta mark set (meta mark & 0xefffffff) | 0x20000000 counter accept
+RULES
+ [ "$(cat "$state/protect" 2>/dev/null || true)" != false ] || sed -i "/xdvpn_deny4 meta mark/d" "$f"
+ nft -f "$f" 2>/dev/null || { rm -f "$f"; return 1; }
+ rm -f "$f"
+ for chain in mangle_prerouting dstnat mangle_output nat_output; do
+  nft list chain inet fw4 "$chain" >/dev/null 2>&1 || continue
+  first=$(nft -a list chain inet fw4 "$chain" | sed -n '/# handle/p' | sed '/chain .*{/d' | head -1)
+  case "$first" in *'jump xdvpn_select'*'comment "xdvpn-priority"'*) continue;; esac
+  for h in $(nft -a list chain inet fw4 "$chain" | sed -n '/comment "xdvpn-priority"/s/.*# handle //p'); do nft delete rule inet fw4 "$chain" handle "$h"; done
+  nft insert rule inet fw4 "$chain" jump xdvpn_select comment '"xdvpn-priority"'
+ done
+}
+underlay() {
+ for table in 51833 51834; do
+ if [ ! -e "$state/pbr-owned" ] && ip -4 route show table "$table" 2>/dev/null | grep -q .; then return 1; fi
+ done
+ ip -4 route replace table 51834 default dev vpn-xdvpn
+ for priority in 10010 10020; do
+  found=$(ip -4 rule show | sed -n "/^$priority:/p")
+  [ -z "$found" ] || [ -e "$state/pbr-owned" ] || return 1
+ done
+ : > "$state/pbr-owned"
+ # Reserved exclusively for XDVPN. Refuse to overwrite another policy rule.
+ for spec in '10010 0x10000000 51833' '10020 0x20000000 51834'; do
+  set -- $spec
+  found=$(ip -4 rule show | sed -n "/^$1:/p")
+  if [ -n "$found" ]; then
+   case "$found" in *"fwmark $2/$2 lookup $3"*) :;; *) return 1;; esac
+  else ip -4 rule add priority "$1" fwmark "$2/$2" lookup "$3"; fi
+ done
+ # Connected routes must exist before installing a gateway in this table.
+ ip -4 route show table main scope link | sed '/dev vpn-xdvpn/d; s/ linkdown//g' | while IFS= read -r route; do
+  ip -4 route replace table 51833 $route
+ done
+ ip -4 route show table main default | while IFS= read -r route; do
+  ip -4 route replace table 51833 $route
+ done
+ ip -4 route show table 51833 | sed -n '/^default /p' | grep -q .
+}
+disable_protection() {
+ init
+ changed=0
+ for f in /tmp/dnsmasq.*.d/90-xdvpn-protect.conf; do [ ! -f "$f" ] || { rm -f "$f"; changed=1; }; done
+ [ "$changed" != 1 ] || /etc/init.d/dnsmasq restart
+ nft flush set inet xdvpn_guard deny4
+ nft flush set inet xdvpn_guard deny6
+ nft flush set inet fw4 xdvpn_deny4
+}
+case "${1:-}" in
+ init) init;;
+ disable-protection) disable_protection;;
+ apply)
+ init
+ protect="${XDVPN_PROTECT:-true}"
+ [ "${XDVPN_MODE:-}" != global4 ] || protect=false
+ printf '%s' "$protect" > "$state/protect"
+ printf '%s' "${XDVPN_MODE:-networks}" > "$state/mode"
+ underlay
+ allow=$(join_cidrs "${XDVPN_ALLOW_NETWORKS:-}")
+ localnets=$(ip -4 route show table main scope link | sed '/dev vpn-xdvpn/d' | awk '{print $1}')
+ bypass=$(join_cidrs "127.0.0.0/8 169.254.0.0/16 224.0.0.0/4 $localnets ${XDVPN_ENDPOINT:-} ${XDVPN_SERVER_EXCLUDES:-}")
+ printf '%s' "$allow" > "$state/allow"
+ printf '%s' "$bypass" > "$state/bypass"
+ f=$(mktemp "$state/apply.XXXXXX")
+ printf 'flush set inet xdvpn_guard allow4\nflush chain inet xdvpn_guard egress\n' > "$f"
+ printf 'add rule inet xdvpn_guard egress oifname "vpn-xdvpn" ip daddr @block4 counter drop comment "xdvpn-blacklist-drop"\n' >> "$f"
+ if [ "$protect" != false ]; then
+  printf 'add rule inet xdvpn_guard egress oifname "vpn-xdvpn" ip daddr @deny4 counter drop comment "xdvpn-protected-drop"\n' >> "$f"
+ fi
+ printf 'add rule inet xdvpn_guard egress oifname "vpn-xdvpn" meta nfproto ipv6 counter drop comment "xdvpn-no-ipv6"\nadd rule inet xdvpn_guard egress oifname "vpn-xdvpn" ip daddr != @allow4 ip daddr != @domain4 counter drop comment "xdvpn-not-company-drop"\n' >> "$f"
+ [ -z "$allow" ] || printf 'add element inet xdvpn_guard allow4 { %s }\n' "$allow" >> "$f"
+ for chain in global6_out global6_forward; do
+  nft list chain inet xdvpn_guard "$chain" >/dev/null 2>&1 && printf 'flush chain inet xdvpn_guard %s\ndelete chain inet xdvpn_guard %s\n' "$chain" "$chain" >> "$f" || true
+ done
+ if [ "${XDVPN_MODE:-}" = global4 ]; then
+  for spec in 'global6_out output' 'global6_forward forward'; do
+   set -- $spec
+   printf 'add chain inet xdvpn_guard %s { type filter hook %s priority 10; policy accept; }\n' "$1" "$2" >> "$f"
+   printf 'add rule inet xdvpn_guard %s meta nfproto ipv6 ip6 daddr != { ::1, fc00::/7, fe80::/10, ff00::/8 } reject with icmpv6 type admin-prohibited\n' "$1" >> "$f"
+  done
+ fi
+ nft -f "$f" 2>/dev/null || { rm -f "$f"; exit 1; }
+ rm -f "$f"
+ restore
+ ;;
+ audit)
+ [ -e "$state/pbr-owned" ] || exit 1
+ /usr/libexec/xdvpn/priority-status --check || {
+  underlay
+  restore
+  /usr/libexec/xdvpn/priority-status --check
+ }
+ ;;
+ check) restore;;
+ clear)
+ for chain in mangle_prerouting dstnat mangle_output nat_output; do
+  for h in $(nft -a list chain inet fw4 "$chain" 2>/dev/null | sed -n '/comment "xdvpn-priority"/s/.*# handle //p'); do nft delete rule inet fw4 "$chain" handle "$h" || true; done
+ done
+ for chain in global6_out global6_forward; do nft flush chain inet xdvpn_guard "$chain" 2>/dev/null || true; nft delete chain inet xdvpn_guard "$chain" 2>/dev/null || true; done
+ nft flush set inet fw4 xdvpn_allow4 2>/dev/null || true
+ nft flush set inet xdvpn_guard allow4 2>/dev/null || true
+ if [ -e "$state/pbr-owned" ]; then
+ ip -4 rule del priority 10010 fwmark 0x10000000/0x10000000 lookup 51833 2>/dev/null || true
+ ip -4 rule del priority 10020 fwmark 0x20000000/0x20000000 lookup 51834 2>/dev/null || true
+ ip -4 route flush table 51833 2>/dev/null || true
+ ip -4 route flush table 51834 2>/dev/null || true
+ fi
+ nft flush set inet xdvpn_guard domain4 2>/dev/null || true
+ nft flush set inet fw4 xdvpn_domain4 2>/dev/null || true
+ changed=0
+ for f in /tmp/dnsmasq.*.d/91-xdvpn-company.conf /tmp/dnsmasq.*.d/92-xdvpn-blacklist.conf; do [ ! -f "$f" ] || { rm -f "$f"; changed=1; }; done
+ [ "$changed" != 1 ] || /etc/init.d/dnsmasq restart
+ rm -f "$state/pbr-owned"
+ rm -f "$state/allow" "$state/bypass"
+ ;;
+ remove)
+ "$0" clear
+ disable_protection
+ nft flush chain inet fw4 xdvpn_select 2>/dev/null || true
+ nft delete chain inet fw4 xdvpn_select 2>/dev/null || true
+ for name in allow4 deny4 bypass4 domain4 block4; do nft delete set inet fw4 "xdvpn_$name" 2>/dev/null || true; done
+ nft delete table inet xdvpn_guard 2>/dev/null || true
+ ;;
+ *) exit 1;;
+esac

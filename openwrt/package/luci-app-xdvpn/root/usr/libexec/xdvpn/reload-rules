@@ -1,0 +1,11 @@
+#!/bin/sh
+# Signal only the persistent policy owner, never certificate/diagnostic calls.
+ready=$(cat /var/run/xdvpn-policy-ready 2>/dev/null)
+for pid in $(pidof xdvpn-hillstone); do
+ [ "$pid" = "$ready" ] || continue
+ cmd=$(tr '\000' ' ' < /proc/$pid/cmdline)
+ case "$cmd" in
+  *' -netifd '*|*' -policy-watch '*) kill -USR1 "$pid" || exit 1; found=1;;
+ esac
+done
+[ "${found:-0}" = 1 ] && echo '{"status":"refresh_requested"}' || echo '{"status":"offline"}'

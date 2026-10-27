@@ -1,0 +1,15 @@
+{
+  "admin/services/xdvpn": {
+    "title": "XDVPN",
+    "order": 65,
+    "action": {
+      "type": "view",
+      "path": "xdvpn/main_v073"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-xdvpn"
+      ]
+    }
+  }
+}

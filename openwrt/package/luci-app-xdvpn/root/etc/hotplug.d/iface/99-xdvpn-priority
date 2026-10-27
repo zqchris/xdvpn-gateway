@@ -1,0 +1,5 @@
+#!/bin/sh
+[ "$INTERFACE" = xdvpn ] || exit 0
+case "$ACTION" in ifup|ifupdate) ;; *) exit 0;; esac
+[ -e /var/run/xdvpn-priority/pbr-owned ] || exit 0
+/usr/libexec/xdvpn/priority check || logger -t xdvpn 'Cannot restore VPN routing after interface update'

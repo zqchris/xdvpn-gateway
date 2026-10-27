@@ -6,6 +6,16 @@
 - 沙盒演练结果：[docs/LAB-RESULTS.md](docs/LAB-RESULTS.md)
 - 状态：0.1.0，本机沙盒 29 个场景、222 项检查全部通过；已装在作者家里的 RT-AX86U 上使用。
 
+## OpenWrt 版本
+
+新增独立的 [OpenWrt 插件](openwrt/README.md)：LuCI 界面、Go Hillstone SCVPN 核心及可选 OpenConnect 接入，提供手动白名单、私有公司预设和 IPv4 全局模式。
+
+- 状态：0.7.3，x86_64 已验证 Hillstone 连接；ARM64 已构建并运行 Linux 测试，路由器真机仍需补测。
+- 设计：[openwrt/docs/DESIGN.md](openwrt/docs/DESIGN.md)
+- 验证与边界：[openwrt/docs/ACCEPTANCE.md](openwrt/docs/ACCEPTANCE.md)、[ARM / WAN 测试](openwrt/docs/PORTABILITY-VALIDATION.md)
+- OpenWrt 版独立维护自有分流规则，不修改其他代理配置；仅在已测试的组合下验证共存，不代表全部 OpenClash/Passwall 模式兼容。
+- 以下华硕构建、测试与安装说明仍适用于原版；OpenWrt 的依赖、IPK 构建与安装见独立文档。两者不是同一个核心，也不共享安装包。
+
 ## 目录
 
 | 路径 | 内容 |
@@ -15,6 +25,7 @@
 | `lab/` | 沙盒：Linux 虚拟机里用网络命名空间模拟家庭网络、运营商、公司 VPN（ocserv）与软件中心；`run.sh` 逐项故障演练 |
 | `lab/web/` | 网页的本地预览与交互检查（模拟 dbus / 状态文件） |
 | `docs/` | 设计文档与演练结果 |
+| `openwrt/` | OpenWrt LuCI 插件、Hillstone 核心、IPK 构建与独立测试（核心 GPL-3.0-only，其余自有代码 MIT） |
 
 ## 构建
 

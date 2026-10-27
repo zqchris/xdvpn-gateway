@@ -1,0 +1,3 @@
+#!/bin/sh
+[ -e /var/run/xdvpn-priority/pbr-owned ] || exit 0
+/usr/libexec/xdvpn/priority check

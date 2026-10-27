@@ -1,0 +1,81 @@
+#!/bin/sh
+# Create only owned sections. Never overwrite an existing interface or zone.
+set -eu
+for section in network.xdvpn firewall.xdvpn firewall.xdvpn_lan; do
+    if uci -q get "$section" >/dev/null; then
+        [ "$(uci -q get "$section.xdvpn_owned")" = 1 ] || {
+            echo "XDVPN: existing unowned section $section; no changes made" >&2
+            exit 1
+        }
+    fi
+done
+if uci -q get network.xdvpn >/dev/null; then
+    [ "$(uci -q get network.xdvpn.xdvpn_owned)" = 1 ] || exit 1
+else
+    uci set network.xdvpn=interface
+    uci set network.xdvpn.xdvpn_owned=1
+    uci set network.xdvpn.proto=openconnect
+    uci set network.xdvpn.auto=0
+    uci set network.xdvpn.interface=wan
+    uci set network.xdvpn.vpn_protocol=anyconnect
+    uci set network.xdvpn.script=/usr/libexec/xdvpn/vpnc-script
+    uci set network.xdvpn.xdvpn_mode=networks
+    uci set network.xdvpn.defaultroute=0
+    uci set network.xdvpn.peerdns=0
+    uci set network.xdvpn.ipv6=0
+    uci set network.xdvpn.delegate=0
+    uci set network.xdvpn.metric=50
+    uci set network.xdvpn.reconnect_timeout=60
+    uci commit network
+fi
+if uci -q get firewall.xdvpn >/dev/null; then
+    [ "$(uci -q get firewall.xdvpn.xdvpn_owned)" = 1 ] || exit 1
+else
+    uci set firewall.xdvpn=zone
+    uci set firewall.xdvpn.xdvpn_owned=1
+    uci set firewall.xdvpn.name=xdvpn
+    uci add_list firewall.xdvpn.network=xdvpn
+    uci set firewall.xdvpn.input=REJECT
+    uci set firewall.xdvpn.output=ACCEPT
+    uci set firewall.xdvpn.forward=REJECT
+    uci set firewall.xdvpn.masq=1
+    uci set firewall.xdvpn.mtu_fix=1
+fi
+if uci -q get firewall.xdvpn_lan >/dev/null; then
+    [ "$(uci -q get firewall.xdvpn_lan.xdvpn_owned)" = 1 ] || exit 1
+else
+    uci set firewall.xdvpn_lan=forwarding
+    uci set firewall.xdvpn_lan.xdvpn_owned=1
+    uci set firewall.xdvpn_lan.src=lan
+    uci set firewall.xdvpn_lan.dest=xdvpn
+fi
+if ! uci -q get firewall.xdvpn_rules >/dev/null; then
+ uci set firewall.xdvpn_rules=include
+ uci set firewall.xdvpn_rules.xdvpn_owned=1
+ uci set firewall.xdvpn_rules.type=script
+ uci set firewall.xdvpn_rules.path=/usr/libexec/xdvpn/firewall-reload
+ uci set firewall.xdvpn_rules.fw4_compatible=1
+fi
+uci commit firewall
+/etc/init.d/xdvpn-rules enable
+/etc/init.d/xdvpn-rules start
+# Bind previously approved exact pins to the already configured endpoint.
+if [ -n "$(uci -q get network.xdvpn.xdvpn_certpin)" ] && [ -z "$(uci -q get network.xdvpn.xdvpn_cert_endpoint)" ]; then
+    server="$(uci -q get network.xdvpn.server)"
+    port="$(uci -q get network.xdvpn.port)"
+    uci set "network.xdvpn.xdvpn_cert_endpoint=$server:${port:-443}"
+    uci commit network
+fi
+if ! uci -q get network.xdvpn.xdvpn_protect_anthropic >/dev/null; then
+    uci set network.xdvpn.xdvpn_protect_anthropic=1
+    uci commit network
+fi
+# Replace pushed full-tunnel mode; old private-list opt-in becomes preset mode.
+mode=$(uci -q get network.xdvpn.xdvpn_mode)
+if [ "$mode" = server ] || { [ "$mode" = networks ] && [ "$(uci -q get network.xdvpn.xdvpn_private_rules)" = 1 ]; }; then
+    uci set network.xdvpn.xdvpn_mode=company
+    uci commit network
+fi
+chmod 600 /etc/config/network
+# No network reload here: installation must not connect or disrupt other interfaces.
+exit 0

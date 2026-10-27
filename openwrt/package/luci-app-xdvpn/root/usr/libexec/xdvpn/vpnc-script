@@ -1,0 +1,97 @@
+#!/bin/sh
+# OpenConnect event hook. netifd owns addresses/routes and removes them on teardown.
+# Do not run the generic vpnc-script: it may import unwanted routes and replace DNS.
+set -f
+[ "${INTERFACE:-}" = xdvpn ] || exit 1
+[ "${TUNDEV:-}" = vpn-xdvpn ] || exit 1
+# Both backends use the same policy; OpenConnect delegates DNS maintenance to
+# a small procd worker. Never preserve the callback's credential environment.
+case "${reason:-}" in
+ connect|reconnect|policy-update)
+  if [ "${XDVPN_HELPER:-}" != 1 ] && [ "$(uci -q get network.xdvpn.proto)" = openconnect ]; then
+   exec /usr/sbin/xdvpn-hillstone -policy-openconnect
+  fi;;
+ disconnect)
+  if [ "${XDVPN_HELPER:-}" != 1 ] && [ "$(uci -q get network.xdvpn.proto)" = openconnect ]; then
+   /etc/init.d/xdvpn-policy stop
+   rm -f /var/run/xdvpn-openconnect.json
+   XDVPN_PRIORITY=1
+  fi;;
+esac
+. /lib/netifd/netifd-proto.sh
+
+XDVPN_ALLOW_NETWORKS=""
+valid_ip4() {
+    printf '%s\n' "$1" | awk -F. '
+        NF != 4 { exit 1 }
+        { for (i=1;i<=4;i++) if ($i !~ /^[0-9]+$/ || $i > 255 || length($i)>3) exit 1 }
+    '
+}
+
+add_network() {
+    local cidr="$1" addr mask
+    case "$cidr" in */*) :;; *) cidr="$cidr/32";; esac
+    addr="${cidr%/*}"; mask="${cidr##*/}"
+    [ "$addr" != "$cidr" ] || return 1
+    valid_ip4 "$addr" || return 1
+    case "$mask" in ''|*[!0-9]*) return 1;; esac
+    [ "${#mask}" -le 2 ] && [ "$mask" -ge "${minimum_mask:-1}" ] && [ "$mask" -le 32 ] || return 1
+    XDVPN_ALLOW_NETWORKS="$XDVPN_ALLOW_NETWORKS $cidr"
+    [ "${XDVPN_PRIORITY:-}" = 1 ] || proto_add_ipv4_route "$addr" "$mask"
+}
+
+case "${reason:-}" in
+    pre-init|attempt-reconnect) exit 0;;
+    connect|reconnect|policy-update)
+        valid_ip4 "${INTERNAL_IP4_ADDRESS:-}" || exit 1
+        proto_init_update "$TUNDEV" 1
+        proto_add_ipv4_address "$INTERNAL_IP4_ADDRESS" 32 "" "$INTERNAL_IP4_ADDRESS"
+        mode="${XDVPN_MODE:-$(uci -q get network.xdvpn.xdvpn_mode)}"
+        [ "$mode" != server ] || mode=company
+        XDVPN_MODE="$mode"; export XDVPN_MODE
+        case "$mode" in
+            networks|company)
+                for addr in ${XDVPN_DOMAIN_IPS:-}; do
+                    valid_ip4 "$addr" || exit 1
+                    XDVPN_ALLOW_NETWORKS="$XDVPN_ALLOW_NETWORKS $addr/32"
+                    [ "${XDVPN_PRIORITY:-}" = 1 ] || proto_add_ipv4_route "$addr" 32
+                done
+                for cidr in $(uci -q get network.xdvpn.xdvpn_networks); do
+                    add_network "$cidr" || {
+                        logger -t xdvpn 'Invalid IPv4 network; refusing route update'
+                        exit 1
+                    }
+                done
+                if [ "$mode" = company ]; then
+                    [ "${XDVPN_COMPANY_READY:-}" = 1 ] || exit 1
+                    for cidr in ${XDVPN_COMPANY_NETWORKS:-}; do
+                        add_network "$cidr" || exit 1
+                    done
+                fi
+                ;;
+            global4)
+                # Preserve the WAN default and its gateway dependency. Not IPv6 global.
+                add_network 0.0.0.0/1 || exit 1
+                add_network 128.0.0.0/1 || exit 1
+                ;;
+            *) exit 1;;
+        esac
+        # Report internal DNS addresses as reachable, but never replace system DNS.
+        for dns in ${INTERNAL_IP4_DNS:-}; do
+            valid_ip4 "$dns" || continue
+            XDVPN_ALLOW_NETWORKS="$XDVPN_ALLOW_NETWORKS $dns/32"
+            proto_add_ipv4_route "$dns" 32
+        done
+        if [ "${XDVPN_PRIORITY:-}" = 1 ]; then
+            export XDVPN_ALLOW_NETWORKS
+            /usr/libexec/xdvpn/priority apply || exit 1
+        fi
+        [ "$reason" = policy-update ] || proto_send_update "$INTERFACE"
+        ;;
+    disconnect)
+        [ "${XDVPN_PRIORITY:-}" != 1 ] || /usr/libexec/xdvpn/priority clear
+        proto_init_update "$TUNDEV" 0
+        proto_send_update "$INTERFACE"
+        ;;
+    *) exit 1;;
+esac

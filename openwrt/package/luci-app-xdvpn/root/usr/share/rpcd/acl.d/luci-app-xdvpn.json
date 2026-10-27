@@ -1,0 +1,40 @@
+{
+  "luci-app-xdvpn": {
+    "description": "Configure the XDVPN network interface",
+    "read": {
+      "uci": [
+        "network"
+      ],
+      "ubus": {
+        "network.interface.xdvpn": [
+          "status"
+        ],
+        "xdvpn": [
+          "certificate",
+          "activity",
+          "domain",
+          "company_rules",
+          "priority_status"
+        ]
+      }
+    },
+    "write": {
+      "uci": [
+        "network"
+      ],
+      "ubus": {
+        "network.interface.xdvpn": [
+          "up",
+          "down"
+        ],
+        "xdvpn": [
+          "reload_rules",
+          "import_company_rules"
+        ],
+        "uci": [
+          "commit"
+        ]
+      }
+    }
+  }
+}

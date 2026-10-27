@@ -1,0 +1,31 @@
+#!/bin/sh
+# Read-only, bounded metadata checks. Does not dump addresses or proxy configs.
+state=/var/run/xdvpn-priority
+if [ ! -e "$state/pbr-owned" ]; then [ "$1" != --check ] || exit 1; echo '{"status":"inactive"}'; exit 0; fi
+ok=true
+for chain in mangle_prerouting dstnat mangle_output nat_output; do
+ # Native fw4 has no nat_output; inspect it only when another plugin creates it.
+ # Missing required fw4 chains must still fail the check below.
+ if [ "$chain" = nat_output ] && ! nft list chain inet fw4 "$chain" >/dev/null 2>&1; then continue; fi
+ first=$(nft -a list chain inet fw4 "$chain" 2>/dev/null | sed -n '/# handle/p' | sed '/chain .*{/d' | head -1)
+ case "$first" in *'jump xdvpn_select'*'comment "xdvpn-priority"'*) :;; *) ok=false;; esac
+done
+rules=$(ip -4 rule show) || ok=false
+printf '%s\n' "$rules" | grep -q '^10010:.*fwmark 0x10000000/0x10000000 lookup 51833' || ok=false
+printf '%s\n' "$rules" | grep -q '^10020:.*fwmark 0x20000000/0x20000000 lookup 51834' || ok=false
+ip -4 route show table 51834 2>/dev/null | grep -q '^default dev vpn-xdvpn' || ok=false
+ip -4 route show table 51833 2>/dev/null | grep -q '^default ' || ok=false
+[ "$1" != --check ] || { [ "$ok" = true ]; exit $?; }
+foreign=false
+chains=$(nft list chains 2>/dev/null) || foreign=true
+if printf '%s\n' "$chains" | awk '
+ /^table / { own=($2=="inet" && ($3=="fw4" || $3=="xdvpn_guard")) }
+ /hook (prerouting|output|ingress) / {if (!own) found=1}
+ END {exit !found}'; then foreign=true; fi
+# Any earlier policy rule may intercept marked traffic. Do not silently whitelist
+# another plugin merely by its name or mark value.
+if printf '%s\n' "$rules" | awk '$1+0>0 && $1+0<10020 && $1+0!=10010 {found=1} END {exit !found}'; then foreign=true; fi
+if [ "$ok" != true ]; then status=repair_needed
+elif [ "$foreign" = true ]; then status=review_required
+else status=ordered; fi
+printf '{"status":"%s","owned_order_ok":%s,"other_hooks_or_rules":%s}\n' "$status" "$ok" "$foreign"

@@ -1,0 +1,14 @@
+#!/bin/sh
+case "$1" in
+ list) echo '{"import_company_rules":{"content":"String"},"priority_status":{},"company_rules":{},"certificate":{},"reload_rules":{},"activity":{},"domain":{"domain":"String"}}';;
+ call)
+  if [ "$2" = import_company_rules ]; then exec /usr/sbin/xdvpn-hillstone -company-import; fi
+  if [ "$2" = priority_status ]; then exec /usr/libexec/xdvpn/priority-status; fi
+  if [ "$2" = company_rules ]; then exec /usr/sbin/xdvpn-hillstone -company-info; fi
+  if [ "$2" = activity ]; then exec /usr/sbin/xdvpn-hillstone -activity-info; fi
+  if [ "$2" = domain ]; then exec /usr/sbin/xdvpn-hillstone -domain-info; fi
+  if [ "$2" = reload_rules ]; then exec /usr/libexec/xdvpn/reload-rules; fi
+  [ "$2" = certificate ] || exit 1
+  /usr/sbin/xdvpn-hillstone -certificate-info 2>/dev/null || echo '{"error":"无法读取服务器证书，请检查已保存的服务器地址、端口及核心是否安装"}'
+  ;;
+esac
